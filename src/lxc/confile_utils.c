@@ -434,6 +434,9 @@ void lxc_clear_netdev(struct lxc_netdev *netdev)
 			lxc_list_del(cur);
 			free(cur);
 		}
+	} else if (netdev->type == LXC_NET_PHYS) {
+		free_string_list(netdev->priv.phys_attr.altnames);
+		netdev->priv.phys_attr.altnames = NULL;
 	}
 
 	head = netdev->head;
