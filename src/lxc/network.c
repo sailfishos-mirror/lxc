@@ -1969,7 +1969,7 @@ int netdev_get_mtu(int ifindex)
 	 */
 	answer_len = answer->nlmsghdr->nlmsg_len;
 
-	nlmsg->nlmsghdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlmsg->nlmsghdr->nlmsg_flags = NLM_F_REQUEST;
 	nlmsg->nlmsghdr->nlmsg_type = RTM_GETLINK;
 
 	ifi = nlmsg_reserve(nlmsg, sizeof(struct ifinfomsg));
@@ -1977,9 +1977,9 @@ int netdev_get_mtu(int ifindex)
 		return ret_errno(ENOMEM);
 
 	ifi->ifi_family = AF_UNSPEC;
+	ifi->ifi_index = ifindex;
 
-	/* Send the request for addresses, which returns all addresses
-	 * on all interfaces. */
+	/* Send the request for netdev info (RTM_GETLINK) for a specified ifindex. */
 	err = netlink_send(nlh_ptr, nlmsg);
 	if (err < 0)
 		return ret_set_errno(-1, errno);
