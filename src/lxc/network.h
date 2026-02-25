@@ -106,6 +106,7 @@ struct ifla_ipvlan {
  */
 struct ifla_phys {
 	int ifindex;
+	char **altnames;
 	int mtu;
 };
 

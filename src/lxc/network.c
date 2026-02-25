@@ -1183,6 +1183,263 @@ on_error:
 	return -1;
 }
 
+static int lxc_netdev_get_altnames(int ifindex, char ***altnames)
+{
+	call_cleaner(nlmsg_free) struct nlmsg *answer = NULL, *nlmsg = NULL;
+	struct nl_handler nlh = NL_HANDLER_INIT;
+	call_cleaner(netlink_close) struct nl_handler *nlh_ptr = &nlh;
+	int readmore = 0;
+	__u32 recv_len = 0;
+	int answer_len, err;
+	struct ifinfomsg *ifi;
+	struct nlmsghdr *msg;
+	struct rtattr *proplist = NULL;
+
+	if (!altnames)
+		return ret_errno(EINVAL);
+
+	err = netlink_open(nlh_ptr, NETLINK_ROUTE);
+	if (err)
+		return err;
+
+	nlmsg = nlmsg_alloc(NLMSG_GOOD_SIZE);
+	if (!nlmsg)
+		return ret_errno(ENOMEM);
+
+	answer = nlmsg_alloc_reserve(NLMSG_GOOD_SIZE);
+	if (!answer)
+		return ret_errno(ENOMEM);
+
+	/* Save the answer buffer length, since it will be overwritten
+	 * on the first receive (and we might need to receive more than
+	 * once.
+	 */
+	answer_len = answer->nlmsghdr->nlmsg_len;
+
+	nlmsg->nlmsghdr->nlmsg_flags = NLM_F_REQUEST;
+	nlmsg->nlmsghdr->nlmsg_type = RTM_GETLINK;
+
+	ifi = nlmsg_reserve(nlmsg, sizeof(struct ifinfomsg));
+	if (!ifi)
+		return ret_errno(ENOMEM);
+
+	ifi->ifi_family = AF_UNSPEC;
+	ifi->ifi_index = ifindex;
+
+	/* Send the request for netdev info (RTM_GETLINK) for a specified ifindex. */
+	err = netlink_send(nlh_ptr, nlmsg);
+	if (err < 0)
+		return ret_set_errno(-1, errno);
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-align"
+
+	do {
+		/* Restore the answer buffer length, it might have been
+		 * overwritten by a previous receive.
+		 */
+		answer->nlmsghdr->nlmsg_len = answer_len;
+
+		/* Get the (next) batch of reply messages */
+		err = netlink_rcv(nlh_ptr, answer);
+		if (err < 0)
+			return ret_set_errno(-1, errno);
+
+		recv_len = err;
+
+		/* Satisfy the typing for the netlink macros */
+		msg = answer->nlmsghdr;
+
+		while (NLMSG_OK(msg, recv_len) && !proplist) {
+			/* Stop reading if we see an error message */
+			if (msg->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *errmsg = (struct nlmsgerr *)NLMSG_DATA(msg);
+				return ret_set_errno(errmsg->error, errno);
+			}
+
+			/* Stop reading if we see a NLMSG_DONE message */
+			if (msg->nlmsg_type == NLMSG_DONE) {
+				readmore = 0;
+				WARN("Received NLMSG_DONE, stopping read");
+				break;
+			}
+
+			if (msg->nlmsg_type != RTM_NEWLINK)
+				return ret_errno(EINVAL);
+
+			ifi = NLMSG_DATA(msg);
+			if (ifi->ifi_index == ifindex) {
+				struct rtattr *rta = IFLA_RTA(ifi);
+				int attr_len = msg->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+
+				while (RTA_OK(rta, attr_len) && !proplist) {
+					unsigned short type = rta->rta_type & ~NLA_F_NESTED;
+
+					if (type == IFLA_PROP_LIST) {
+						proplist = rta;
+						TRACE("Found IFLA_PROP_LIST for ifindex %d", ifindex);
+						break;
+					}
+
+					rta = RTA_NEXT(rta, attr_len);
+				}
+			}
+
+			/* Keep reading more data from the socket if the last
+			 * message had the NLF_F_MULTI flag set.
+			 */
+			readmore = (msg->nlmsg_flags & NLM_F_MULTI);
+
+			/* Look at the next message received in this buffer. */
+			msg = NLMSG_NEXT(msg, recv_len);
+		}
+	} while (readmore);
+
+	/* Found IFLA_PROP_LIST? */
+	if (proplist) {
+		struct rtattr *i = RTA_DATA(proplist);
+		int proplist_len = RTA_PAYLOAD(proplist);
+
+		while (RTA_OK(i, proplist_len)) {
+			if (i->rta_type != IFLA_ALT_IFNAME)
+				continue;
+
+			err = lxc_append_string(altnames, (char *)RTA_DATA(i));
+			if (err < 0)
+				return ret_errno(ENOMEM);
+
+			i = RTA_NEXT(i, proplist_len);
+		}
+
+		if (proplist_len)
+			ERROR("IFLA_PROP_LIST has %d bytes of unparsed attributes", proplist_len);
+	}
+
+#pragma GCC diagnostic pop
+
+	return 0;
+}
+
+static int lxc_netdev_mod_altname(int ifindex, const char *altname, bool create)
+{
+	call_cleaner(nlmsg_free) struct nlmsg *answer = NULL, *nlmsg = NULL;
+	struct nl_handler nlh = NL_HANDLER_INIT;
+	call_cleaner(netlink_close) struct nl_handler *nlh_ptr = &nlh;
+	int err;
+	struct ifinfomsg *ifi;
+	struct rtattr *nest;
+
+	err = netlink_open(nlh_ptr, NETLINK_ROUTE);
+	if (err)
+		return err;
+
+	nlmsg = nlmsg_alloc(NLMSG_GOOD_SIZE);
+	if (!nlmsg)
+		return ret_errno(ENOMEM);
+
+	answer = nlmsg_alloc_reserve(NLMSG_GOOD_SIZE);
+	if (!answer)
+		return ret_errno(ENOMEM);
+
+	if (create) {
+		nlmsg->nlmsghdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK |
+					       NLM_F_EXCL | NLM_F_CREATE | NLM_F_APPEND;
+		nlmsg->nlmsghdr->nlmsg_type = RTM_NEWLINKPROP;
+	} else {
+		nlmsg->nlmsghdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+		nlmsg->nlmsghdr->nlmsg_type = RTM_DELLINKPROP;
+	}
+
+	ifi = nlmsg_reserve(nlmsg, sizeof(struct ifinfomsg));
+	if (!ifi)
+		return ret_errno(ENOMEM);
+	ifi->ifi_family = AF_UNSPEC;
+	ifi->ifi_index = ifindex;
+
+	nest = nla_begin_nested(nlmsg, IFLA_PROP_LIST | NLA_F_NESTED);
+	if (!nest)
+		return ret_errno(ENOMEM);
+
+	if (nla_put_string(nlmsg, IFLA_ALT_IFNAME, altname))
+		return ret_errno(ENOMEM);
+
+	nla_end_nested(nlmsg, nest);
+
+	return netlink_transaction(nlh_ptr, nlmsg, answer);
+}
+
+static int lxc_netdev_add_altname(int ifindex, const char *altname)
+{
+	return lxc_netdev_mod_altname(ifindex, altname, true);
+}
+
+static int lxc_netdev_delete_altname(int ifindex, const char *altname)
+{
+	return lxc_netdev_mod_altname(ifindex, altname, false);
+}
+
+static int lxc_netdev_keep_altnames(struct lxc_netdev *netdev)
+{
+	int err;
+
+	if (netdev->type != LXC_NET_PHYS)
+		return -1;
+
+	err = lxc_netdev_get_altnames(netdev->ifindex, &netdev->priv.phys_attr.altnames);
+	if (err < 0)
+		return log_error_errno(-1, -err, "Failed to get altnames for interface \"%s\"", netdev->link);
+
+	for (char **altname = netdev->priv.phys_attr.altnames; altname && *altname; altname++) {
+		err = lxc_netdev_delete_altname(netdev->ifindex, *altname);
+		if (err < 0)
+			return log_error_errno(-1, -err, "Failed to delete altname \"%s\" for interface \"%s\"", *altname, netdev->link);
+
+		DEBUG("Removed original altname \"%s\" for physical interface \"%s\"", *altname, netdev->link);
+	}
+
+	return 0;
+}
+
+static int lxc_netdev_restore_altnames(struct lxc_netdev *netdev)
+{
+	__do_free_string_list char **altnames = NULL;
+	__do_free_string_list char **orig_altnames = NULL;
+	int err;
+
+	if (netdev->type != LXC_NET_PHYS)
+		return -1;
+
+	/* let cleaner free netdev->priv.phys_attr.altnames */
+	orig_altnames = netdev->priv.phys_attr.altnames;
+	netdev->priv.phys_attr.altnames = NULL;
+
+	/*
+	 * Retrieve and remove all IFLA_ALT_IFNAME, because they were
+	 * added by userspace inside the container.
+	 */
+	err = lxc_netdev_get_altnames(netdev->ifindex, &altnames);
+	if (err < 0)
+		return log_error_errno(-1, -err, "Failed to get altnames for interface \"%s\"", netdev->link);
+
+	for (char **altname = altnames; altname && *altname; altname++) {
+		err = lxc_netdev_delete_altname(netdev->ifindex, *altname);
+		if (err < 0)
+			return log_error_errno(-1, -err, "Failed to delete altname \"%s\" for interface \"%s\"", *altname, netdev->link);
+
+		DEBUG("Removed altname \"%s\" for physical interface \"%s\"", *altname, netdev->link);
+	}
+
+	for (char **altname = orig_altnames; altname && *altname; altname++) {
+		err = lxc_netdev_add_altname(netdev->ifindex, *altname);
+		if (err < 0)
+			return log_error_errno(-1, -err, "Failed to restore altname \"%s\" for interface \"%s\"", *altname, netdev->link);
+
+		DEBUG("Restored altname \"%s\" for interface \"%s\"", *altname, netdev->link);
+	}
+
+	return 0;
+}
+
 static int netdev_configure_server_phys(struct lxc_handler *handler, struct lxc_netdev *netdev)
 {
 	int err, mtu_orig = 0;
@@ -1221,6 +1478,14 @@ static int netdev_configure_server_phys(struct lxc_handler *handler, struct lxc_
 		return log_error_errno(-1, -mtu_orig, "Failed to get original mtu for interface \"%s\"", netdev->link);
 
 	netdev->priv.phys_attr.mtu = mtu_orig;
+
+	/*
+	 * Save all netdev altnames and clean them up from the netdevice,
+	 * so container gets a clean state.
+	 */
+	err = lxc_netdev_keep_altnames(netdev);
+	if (err < 0)
+		return log_error_errno(-1, -err, "Failed to save and cleanup altnames for interface \"%s\"", netdev->link);
 
 	if (netdev->mtu) {
 		unsigned int mtu;
@@ -3669,15 +3934,22 @@ static bool lxc_delete_network_priv(struct lxc_handler *handler)
 			 * with their transient name to avoid collisions
 			 */
 			netdev->ifindex = if_nametoindex(netdev->transient_name);
+
+			ret = lxc_netdev_restore_altnames(netdev);
+			if (ret < 0)
+				WARN("Failed to restore altnames for interface with index %d and initial name \"%s\"",
+				     netdev->ifindex, netdev->link);
+
 			ret = lxc_netdev_rename_by_index(netdev->ifindex, netdev->link);
 			if (ret < 0)
 				WARN("Failed to rename interface with index %d "
 				     "from \"%s\" to its initial name \"%s\"",
-				     netdev->ifindex, netdev->name, netdev->link);
+				     netdev->ifindex, netdev->transient_name,
+				     netdev->link);
 			else {
 				TRACE("Renamed interface with index %d from "
 				      "\"%s\" to its initial name \"%s\"",
-				      netdev->ifindex, netdev->name,
+				      netdev->ifindex, netdev->transient_name,
 				      netdev->link);
 
 				/* Restore original MTU */
