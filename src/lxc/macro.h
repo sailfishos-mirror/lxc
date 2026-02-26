@@ -463,6 +463,14 @@ extern int __build_bug_on_failed;
 #define IFLA_NET_NS_FD 28
 #endif
 
+#ifndef IFLA_PROP_LIST
+#define IFLA_PROP_LIST 52
+#endif
+
+#ifndef IFLA_ALT_IFNAME
+#define IFLA_ALT_IFNAME 53
+#endif
+
 #ifndef IFLA_INFO_KIND
 #define IFLA_INFO_KIND 1
 #endif
@@ -530,6 +538,14 @@ extern int __build_bug_on_failed;
 
 #ifndef RTM_GETNSID
 #define RTM_GETNSID 90
+#endif
+
+#ifndef RTM_NEWLINKPROP
+#define RTM_NEWLINKPROP 108
+#endif
+
+#ifndef RTM_DELLINKPROP
+#define RTM_DELLINKPROP 109
 #endif
 
 #ifndef NLMSG_ERROR
