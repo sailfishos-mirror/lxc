@@ -320,6 +320,7 @@ char *storage_copy(struct lxc_container *c, const char *cname,
 		.dfd_host		= -EBADF,
 		.fd_path_pin		= -EBADF,
 		.dfd_idmapped		= -EBADF,
+		.storage                = NULL,
 	};
 
 	if (!src) {
@@ -422,6 +423,7 @@ char *storage_copy(struct lxc_container *c, const char *cname,
 	}
 	TRACE("Initialized %s storage driver", new->type);
 	new->rootfs = &new_rootfs;
+	new_rootfs.storage = new;
 
 	/* create new paths */
 	ret = new->ops->clone_paths(orig, new, oldname, cname, oldpath, lxcpath,
@@ -517,19 +519,16 @@ char *storage_copy(struct lxc_container *c, const char *cname,
 	}
 
 on_success:
-	/* The only caller, copy_storage, doesn't ever close this. */
-	close_prot_errno_disarm(new_rootfs.dfd_idmapped);
-	lxc_storage_put(c->lxc_conf);
-
 	ret_str = must_copy_string(new->src);
-	storage_put(new);
+	lxc_storage_put(c->lxc_conf);
+	put_lxc_rootfs(&new_rootfs, true);
+
 	return ret_str;
 
 on_error_put_new:
-	storage_put(new);
+	put_lxc_rootfs(&new_rootfs, true);
 
 on_error_put_orig:
-	close_prot_errno_disarm(new_rootfs.dfd_idmapped);
 	lxc_storage_put(c->lxc_conf);
 
 	return NULL;
